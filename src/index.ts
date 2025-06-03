@@ -41,12 +41,19 @@ const getLineClient = (env: Env) =>
 	});
 
 // ---- KV State management helpers --------------------------------------------
-const getUserState = async (kv: KVNamespace, userId: string): Promise<UserState> => {
+const getUserState = async (
+	kv: KVNamespace,
+	userId: string,
+): Promise<UserState> => {
 	const state = await kv.get(`user:${userId}`, "json");
 	return state || { step: 0, answers: {} };
 };
 
-const setUserState = async (kv: KVNamespace, userId: string, state: UserState): Promise<void> => {
+const setUserState = async (
+	kv: KVNamespace,
+	userId: string,
+	state: UserState,
+): Promise<void> => {
 	await kv.put(`user:${userId}`, JSON.stringify(state));
 };
 
@@ -196,7 +203,7 @@ app.post("/webhook", async (c) => {
 				state.answers.rent = data.split("=")[1];
 				state.step = 99;
 				await setUserState(c.env.USER_STATE, uid, state);
-				
+
 				const { subsidyAmount, rent } = state.answers;
 				if (subsidyAmount && rent) {
 					replies.push(
