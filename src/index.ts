@@ -7,10 +7,31 @@ import { messagingApi, validateSignature } from "@line/bot-sdk";
 // ---------------------------------------------------------------
 import { Hono } from "hono";
 
+// ---- Type definitions -------------------------------------------------------
+declare global {
+	interface KVNamespace {
+		get(key: string, type?: "text"): Promise<string | null>;
+		get(key: string, type: "json"): Promise<UserState | null>;
+		put(key: string, value: string): Promise<void>;
+		delete(key: string): Promise<void>;
+	}
+}
+
 // ---- Cloudflare env typing --------------------------------------------------
 interface Env {
 	LINE_CHANNEL_SECRET: string;
 	LINE_CHANNEL_ACCESS_TOKEN: string;
+	USER_STATE: KVNamespace;
+}
+
+// ---- User state type -------------------------------------------------------
+interface UserState {
+	step: number; // 0 = Q1, 1 = Q2, 2 = Q3, 99 = done
+	answers: {
+		subsidy?: boolean;
+		subsidyAmount?: number;
+		rent?: string;
+	};
 }
 
 // ---- LINE SDK client --------------------------------------------------------
@@ -19,13 +40,15 @@ const getLineClient = (env: Env) =>
 		channelAccessToken: env.LINE_CHANNEL_ACCESS_TOKEN,
 	});
 
-// ---- Simple in‑memory state (PoC) -------------------------------------------
-//  In production: replace with KV / D1 / Durable Object.
-const userStep: Record<string, number> = {}; // 0 = Q1, 1 = Q2, 2 = Q3, 99 = done
-const userAnswers: Record<
-	string,
-	{ subsidy?: boolean; subsidyAmount?: number; rent?: string }
-> = {};
+// ---- KV State management helpers --------------------------------------------
+const getUserState = async (kv: KVNamespace, userId: string): Promise<UserState> => {
+	const state = await kv.get(`user:${userId}`, "json");
+	return state || { step: 0, answers: {} };
+};
+
+const setUserState = async (kv: KVNamespace, userId: string, state: UserState): Promise<void> => {
+	await kv.put(`user:${userId}`, JSON.stringify(state));
+};
 
 // ---- QuickReply helpers -----------------------------------------------------
 const quick = (text: string, labels: string[], datas: string[]) => ({
@@ -111,10 +134,13 @@ app.post("/webhook", async (c) => {
 			source: { userId: string };
 			replyToken: string;
 			postback?: { data: string };
+			message?: { type: string; text?: string };
 		};
 		const uid = event.source.userId;
+
 		if (event.type === "follow") {
-			userStep[uid] = 0;
+			const state: UserState = { step: 0, answers: {} };
+			await setUserState(c.env.USER_STATE, uid, state);
 			replies.push(
 				client.replyMessage({
 					replyToken: event.replyToken,
@@ -132,11 +158,12 @@ app.post("/webhook", async (c) => {
 
 		if (event.type === "postback" && event.postback) {
 			const data: string = event.postback.data;
-			const step = userStep[uid] ?? 0;
+			const state = await getUserState(c.env.USER_STATE, uid);
 
-			if (step === 0) {
-				userAnswers[uid] = { subsidy: data.split("=")[1] === "yes" };
-				userStep[uid] = 1;
+			if (state.step === 0) {
+				state.answers.subsidy = data.split("=")[1] === "yes";
+				state.step = 1;
+				await setUserState(c.env.USER_STATE, uid, state);
 				replies.push(
 					client.replyMessage({
 						replyToken: event.replyToken,
@@ -149,9 +176,10 @@ app.post("/webhook", async (c) => {
 						],
 					}),
 				);
-			} else if (step === 1) {
-				userAnswers[uid].subsidyAmount = Number(data.split("=")[1]);
-				userStep[uid] = 2;
+			} else if (state.step === 1) {
+				state.answers.subsidyAmount = Number(data.split("=")[1]);
+				state.step = 2;
+				await setUserState(c.env.USER_STATE, uid, state);
 				replies.push(
 					client.replyMessage({
 						replyToken: event.replyToken,
@@ -164,10 +192,12 @@ app.post("/webhook", async (c) => {
 						],
 					}),
 				);
-			} else if (step === 2) {
-				userAnswers[uid].rent = data.split("=")[1];
-				userStep[uid] = 99;
-				const { subsidyAmount, rent } = userAnswers[uid];
+			} else if (state.step === 2) {
+				state.answers.rent = data.split("=")[1];
+				state.step = 99;
+				await setUserState(c.env.USER_STATE, uid, state);
+				
+				const { subsidyAmount, rent } = state.answers;
 				if (subsidyAmount && rent) {
 					replies.push(
 						client.replyMessage({
@@ -176,7 +206,28 @@ app.post("/webhook", async (c) => {
 						}),
 					);
 				}
-				// TODO: save to Airtable or KV
+			}
+		}
+
+		// Handle text messages - show quick reply if user hasn't started or is lost
+		if (event.type === "message" && event.message?.type === "text") {
+			const state = await getUserState(c.env.USER_STATE, uid);
+			if (state.step === undefined || state.step === 99) {
+				// User hasn't started or finished - restart the flow
+				const newState: UserState = { step: 0, answers: {} };
+				await setUserState(c.env.USER_STATE, uid, newState);
+				replies.push(
+					client.replyMessage({
+						replyToken: event.replyToken,
+						messages: [
+							quick(
+								"住宅手当はありますか？",
+								["ある", "ない"],
+								["subsidy=yes", "subsidy=no"],
+							),
+						],
+					}),
+				);
 			}
 		}
 	}
