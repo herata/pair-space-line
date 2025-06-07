@@ -48,45 +48,105 @@ const getCerebrasClient = (env: Env) =>
 
 // ---- KV State management helpers --------------------------------------------
 const getChatState = async (kv: KVNamespace, userId: string): Promise<ChatState> => {
-	const state = await kv.get(`chat:${userId}`, "json");
-	return state || { messages: [] };
+	try {
+		console.log(`📖 Loading chat state for user: ${userId}`);
+		const state = await kv.get(`chat:${userId}`, "json");
+		const result = state || { messages: [] };
+		console.log(`📖 Chat state loaded: ${result.messages.length} messages`);
+		return result;
+	} catch (error) {
+		console.error(`❌ Error loading chat state for user ${userId}:`, error);
+		// Return empty state on error
+		return { messages: [] };
+	}
 };
 
 const setChatState = async (kv: KVNamespace, userId: string, state: ChatState): Promise<void> => {
-	await kv.put(`chat:${userId}`, JSON.stringify(state));
+	try {
+		console.log(`💾 Saving chat state for user: ${userId} (${state.messages.length} messages)`);
+		await kv.put(`chat:${userId}`, JSON.stringify(state));
+		console.log("💾 Chat state saved successfully");
+	} catch (error) {
+		console.error(`❌ Error saving chat state for user ${userId}:`, error);
+		throw error; // Re-throw to let caller handle
+	}
 };
 
 // ---- AI Chat helpers --------------------------------------------------------
 const generateAIResponse = async (cerebras: Cerebras, messages: Array<{ role: "user" | "assistant"; content: string }>) => {
-	const systemMessage = {
-		role: "system" as const,
-		content: "あなたは親切で知識豊富なアシスタントです。日本語で回答してください。住宅や不動産に関する質問には特に詳しく答えてください。"
-	};
+	try {
+		console.log("🔄 Calling Cerebras API...");
+		
+		const systemMessage = {
+			role: "system" as const,
+			content: "あなたは親切で知識豊富なアシスタントです。日本語で回答してください。住宅や不動産に関する質問には特に詳しく答えてください。"
+		};
 
-	const completion = await cerebras.chat.completions.create({
-		messages: [systemMessage, ...messages],
-		model: "llama3.1-8b",
-		max_tokens: 500,
-		temperature: 0.7,
-	});
+		const completion = await cerebras.chat.completions.create({
+			messages: [systemMessage, ...messages],
+			model: "llama3.1-8b",
+			max_tokens: 500,
+			temperature: 0.7,
+		});
 
-	// Type assertion for Cerebras response
-	const response = completion as { choices: Array<{ message: { content: string } }> };
-	return response.choices?.[0]?.message?.content || "申し訳ありませんが、回答を生成できませんでした。";
+		// Type assertion for Cerebras response
+		const response = completion as { choices: Array<{ message: { content: string } }> };
+		const content = response.choices?.[0]?.message?.content;
+		
+		if (!content) {
+			console.error("❌ No content in Cerebras response");
+			throw new Error("No content received from Cerebras API");
+		}
+		
+		console.log("✅ Cerebras API response received successfully");
+		return content;
+	} catch (error) {
+		console.error("❌ Cerebras API error:", error);
+		throw error;
+	}
 };
 
 // ---- Hono app ---------------------------------------------------------------
 const app = new Hono<{ Bindings: Env }>();
 
+// Add error handling middleware
+app.onError((err, c) => {
+	console.error("🚨 Unhandled application error:", err);
+	return c.json({ error: "Internal server error" }, 500);
+});
+
+// Add request logging middleware
+app.use("*", async (c, next) => {
+	const start = Date.now();
+	const method = c.req.method;
+	const path = c.req.path;
+	
+	console.log(`📥 ${method} ${path} - Request started`);
+	
+	await next();
+	
+	const end = Date.now();
+	const status = c.res.status;
+	console.log(`📤 ${method} ${path} - ${status} (${end - start}ms)`);
+});
+
+// Health check endpoint for monitoring
+app.get("/health", (c) => {
+	console.log("💚 Health check requested");
+	return c.json({ status: "healthy", timestamp: new Date().toISOString() });
+});
+
 app.post("/webhook", async (c) => {
 	const body = await c.req.text();
 	const signature = c.req.header("x-line-signature");
-	if (
-		!signature ||
-		!validateSignature(body, c.env.LINE_CHANNEL_SECRET, signature)
-	) {
+	
+	// Validate LINE signature
+	if (!signature || !validateSignature(body, c.env.LINE_CHANNEL_SECRET, signature)) {
+		console.error("❌ Invalid signature");
 		return c.text("Bad signature", 400);
 	}
+
+	console.log("✅ Webhook received and validated");
 
 	const events = JSON.parse(body).events as unknown[];
 	const client = getLineClient(c.env);
@@ -102,8 +162,11 @@ app.post("/webhook", async (c) => {
 		};
 		const uid = event.source.userId;
 
+		console.log(`📋 Processing event: ${event.type} for user: ${uid}`);
+
 		if (event.type === "follow") {
 			// Welcome message when user follows the bot
+			console.log("👋 User followed bot, sending welcome message");
 			replies.push(
 				client.replyMessage({
 					replyToken: event.replyToken,
@@ -122,11 +185,15 @@ app.post("/webhook", async (c) => {
 			const userMessage = event.message.text;
 			
 			if (!userMessage) {
+				console.log("⚠️ Received empty message, skipping");
 				continue;
 			}
 			
+			console.log(`👤 User message: ${userMessage}`);
+			
 			// Get chat history
 			const chatState = await getChatState(c.env.USER_STATE, uid);
+			console.log(`📚 Retrieved chat history: ${chatState.messages.length} messages`);
 			
 			// Add user message to history
 			chatState.messages.push({
@@ -135,8 +202,11 @@ app.post("/webhook", async (c) => {
 			});
 
 			try {
+				console.log("🧠 Generating AI response...");
 				// Generate AI response
 				const aiResponse = await generateAIResponse(cerebras, chatState.messages);
+				
+				console.log(`🤖 AI response generated: ${aiResponse.substring(0, 100)}...`);
 				
 				// Add AI response to history
 				chatState.messages.push({
@@ -147,10 +217,12 @@ app.post("/webhook", async (c) => {
 				// Keep only last 10 messages to avoid hitting limits
 				if (chatState.messages.length > 10) {
 					chatState.messages = chatState.messages.slice(-10);
+					console.log("✂️ Trimmed chat history to 10 messages");
 				}
 
 				// Save updated chat state
 				await setChatState(c.env.USER_STATE, uid, chatState);
+				console.log("💾 Chat state saved to KV");
 
 				// Reply to user
 				replies.push(
@@ -164,24 +236,31 @@ app.post("/webhook", async (c) => {
 						],
 					}),
 				);
+				console.log("📤 Reply message queued");
 			} catch (error) {
-				console.error("Error generating AI response:", error);
+				console.error("❌ Error generating AI response:", error);
+				const errorMessage = "申し訳ありません。一時的にサービスが利用できません。しばらく時間をおいてから再度お試しください。";
+				
 				replies.push(
 					client.replyMessage({
 						replyToken: event.replyToken,
 						messages: [
 							{
 								type: "text",
-								text: "申し訳ありません。一時的にサービスが利用できません。しばらく時間をおいてから再度お試しください。",
+								text: errorMessage,
 							},
 						],
 					}),
 				);
+				console.log("🚨 Error response queued");
 			}
 		}
 	}
 
+	console.log(`📨 Sending ${replies.length} replies`);
 	await Promise.all(replies);
+	console.log("✅ All replies sent successfully");
+	
 	return c.json({ status: "ok" });
 });
 
