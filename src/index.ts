@@ -1,17 +1,18 @@
 import { messagingApi, validateSignature } from "@line/bot-sdk";
-// PairSpace LINE Bot — Cloudflare Workers (Hono + @line/bot-sdk)
-// ---------------------------------------------------------------
-// 1.  npm i hono @line/bot-sdk
-// 2.  wrangler.toml → define env vars: LINE_CHANNEL_SECRET, LINE_CHANNEL_ACCESS_TOKEN
+import Cerebras from "@cerebras/cerebras_cloud_sdk";
+// PairSpace LINE Bot with Cerebras AI — Cloudflare Workers (Hono + @line/bot-sdk + Cerebras)
+// ---------------------------------------------------------------------------------
+// 1.  npm i hono @line/bot-sdk @cerebras/cerebras_cloud_sdk
+// 2.  wrangler.toml → define env vars: LINE_CHANNEL_SECRET, LINE_CHANNEL_ACCESS_TOKEN, CEREBRAS_API_KEY
 // 3.  wrangler deploy
-// ---------------------------------------------------------------
+// ---------------------------------------------------------------------------------
 import { Hono } from "hono";
 
 // ---- Type definitions -------------------------------------------------------
 declare global {
 	interface KVNamespace {
 		get(key: string, type?: "text"): Promise<string | null>;
-		get(key: string, type: "json"): Promise<UserState | null>;
+		get(key: string, type: "json"): Promise<ChatState | null>;
 		put(key: string, value: string): Promise<void>;
 		delete(key: string): Promise<void>;
 	}
@@ -21,10 +22,174 @@ declare global {
 interface Env {
 	LINE_CHANNEL_SECRET: string;
 	LINE_CHANNEL_ACCESS_TOKEN: string;
+	CEREBRAS_API_KEY: string;
 	USER_STATE: KVNamespace;
 }
 
-// ---- User state type -------------------------------------------------------
+// ---- Chat state type -------------------------------------------------------
+interface ChatState {
+	messages: Array<{
+		role: "user" | "assistant";
+		content: string;
+	}>;
+}
+
+// ---- LINE SDK client --------------------------------------------------------
+const getLineClient = (env: Env) =>
+	new messagingApi.MessagingApiClient({
+		channelAccessToken: env.LINE_CHANNEL_ACCESS_TOKEN,
+	});
+
+// ---- Cerebras client --------------------------------------------------------
+const getCerebrasClient = (env: Env) =>
+	new Cerebras({
+		apiKey: env.CEREBRAS_API_KEY,
+	});
+
+// ---- KV State management helpers --------------------------------------------
+const getChatState = async (kv: KVNamespace, userId: string): Promise<ChatState> => {
+	const state = await kv.get(`chat:${userId}`, "json");
+	return state || { messages: [] };
+};
+
+const setChatState = async (kv: KVNamespace, userId: string, state: ChatState): Promise<void> => {
+	await kv.put(`chat:${userId}`, JSON.stringify(state));
+};
+
+// ---- AI Chat helpers --------------------------------------------------------
+const generateAIResponse = async (cerebras: Cerebras, messages: Array<{ role: "user" | "assistant"; content: string }>) => {
+	const systemMessage = {
+		role: "system" as const,
+		content: "あなたは親切で知識豊富なアシスタントです。日本語で回答してください。住宅や不動産に関する質問には特に詳しく答えてください。"
+	};
+
+	const completion = await cerebras.chat.completions.create({
+		messages: [systemMessage, ...messages],
+		model: "llama3.1-8b",
+		max_tokens: 500,
+		temperature: 0.7,
+	});
+
+	// Type assertion for Cerebras response
+	const response = completion as { choices: Array<{ message: { content: string } }> };
+	return response.choices?.[0]?.message?.content || "申し訳ありませんが、回答を生成できませんでした。";
+};
+
+// ---- Hono app ---------------------------------------------------------------
+const app = new Hono<{ Bindings: Env }>();
+
+app.post("/webhook", async (c) => {
+	const body = await c.req.text();
+	const signature = c.req.header("x-line-signature");
+	if (
+		!signature ||
+		!validateSignature(body, c.env.LINE_CHANNEL_SECRET, signature)
+	) {
+		return c.text("Bad signature", 400);
+	}
+
+	const events = JSON.parse(body).events as unknown[];
+	const client = getLineClient(c.env);
+	const cerebras = getCerebrasClient(c.env);
+	const replies: Promise<unknown>[] = [];
+
+	for (const ev of events) {
+		const event = ev as {
+			type: string;
+			source: { userId: string };
+			replyToken: string;
+			message?: { type: string; text?: string };
+		};
+		const uid = event.source.userId;
+
+		if (event.type === "follow") {
+			// Welcome message when user follows the bot
+			replies.push(
+				client.replyMessage({
+					replyToken: event.replyToken,
+					messages: [
+						{
+							type: "text",
+							text: "こんにちは！PairSpace AIチャットボットです🤖\n\n住宅や不動産に関するご質問、その他何でもお気軽にお聞きください！",
+						},
+					],
+				}),
+			);
+			continue;
+		}
+
+		if (event.type === "message" && event.message?.type === "text") {
+			const userMessage = event.message.text;
+			
+			if (!userMessage) {
+				continue;
+			}
+			
+			// Get chat history
+			const chatState = await getChatState(c.env.USER_STATE, uid);
+			
+			// Add user message to history
+			chatState.messages.push({
+				role: "user",
+				content: userMessage,
+			});
+
+			try {
+				// Generate AI response
+				const aiResponse = await generateAIResponse(cerebras, chatState.messages);
+				
+				// Add AI response to history
+				chatState.messages.push({
+					role: "assistant",
+					content: aiResponse,
+				});
+
+				// Keep only last 10 messages to avoid hitting limits
+				if (chatState.messages.length > 10) {
+					chatState.messages = chatState.messages.slice(-10);
+				}
+
+				// Save updated chat state
+				await setChatState(c.env.USER_STATE, uid, chatState);
+
+				// Reply to user
+				replies.push(
+					client.replyMessage({
+						replyToken: event.replyToken,
+						messages: [
+							{
+								type: "text",
+								text: aiResponse,
+							},
+						],
+					}),
+				);
+			} catch (error) {
+				console.error("Error generating AI response:", error);
+				replies.push(
+					client.replyMessage({
+						replyToken: event.replyToken,
+						messages: [
+							{
+								type: "text",
+								text: "申し訳ありません。一時的にサービスが利用できません。しばらく時間をおいてから再度お試しください。",
+							},
+						],
+					}),
+				);
+			}
+		}
+	}
+
+	await Promise.all(replies);
+	return c.json({ status: "ok" });
+});
+
+/*
+// ---- COMMENTED OUT: Original housing subsidy diagnostic flow ----
+// ---- This is the previous implementation that has been replaced ----
+
+// ---- User state type (OLD) -------------------------------------------------------
 interface UserState {
 	step: number; // 0 = Q1, 1 = Q2, 2 = Q3, 99 = done
 	answers: {
@@ -34,13 +199,7 @@ interface UserState {
 	};
 }
 
-// ---- LINE SDK client --------------------------------------------------------
-const getLineClient = (env: Env) =>
-	new messagingApi.MessagingApiClient({
-		channelAccessToken: env.LINE_CHANNEL_ACCESS_TOKEN,
-	});
-
-// ---- KV State management helpers --------------------------------------------
+// ---- KV State management helpers (OLD) --------------------------------------------
 const getUserState = async (
 	kv: KVNamespace,
 	userId: string,
@@ -57,7 +216,7 @@ const setUserState = async (
 	await kv.put(`user:${userId}`, JSON.stringify(state));
 };
 
-// ---- QuickReply helpers -----------------------------------------------------
+// ---- QuickReply helpers (OLD) -----------------------------------------------------
 const quick = (text: string, labels: string[], datas: string[]) => ({
 	type: "text" as const,
 	text,
@@ -69,7 +228,7 @@ const quick = (text: string, labels: string[], datas: string[]) => ({
 	},
 });
 
-// ---- Flex Message Result ----------------------------------------------------
+// ---- Flex Message Result (OLD) ----------------------------------------------------
 const resultFlex = (subsidy: number, rent: string) => ({
 	type: "flex" as const,
 	altText: "診断結果",
@@ -118,129 +277,16 @@ const resultFlex = (subsidy: number, rent: string) => ({
 	},
 });
 
-// ---- Hono app ---------------------------------------------------------------
-const app = new Hono<{ Bindings: Env }>();
+// ---- OLD WEBHOOK IMPLEMENTATION ----
+// The housing subsidy diagnostic flow with QuickReply interactions
+// This implementation used step-based conversation flow:
+// 1. Follow event → Ask about housing subsidy (yes/no)
+// 2. Postback subsidy → Ask about subsidy amount (5万円以上/3万円/1万円以下)
+// 3. Postback amount → Ask about rent range (10-13万/13-16万/16万以上)
+// 4. Postback rent → Show Flex Message result with calculated recommendation
 
-app.post("/webhook", async (c) => {
-	const body = await c.req.text();
-	const signature = c.req.header("x-line-signature");
-	if (
-		!signature ||
-		!validateSignature(body, c.env.LINE_CHANNEL_SECRET, signature)
-	) {
-		return c.text("Bad signature", 400);
-	}
-
-	const events = JSON.parse(body).events as unknown[];
-	const client = getLineClient(c.env);
-	const replies: Promise<unknown>[] = [];
-
-	for (const ev of events) {
-		const event = ev as {
-			type: string;
-			source: { userId: string };
-			replyToken: string;
-			postback?: { data: string };
-			message?: { type: string; text?: string };
-		};
-		const uid = event.source.userId;
-
-		if (event.type === "follow") {
-			const state: UserState = { step: 0, answers: {} };
-			await setUserState(c.env.USER_STATE, uid, state);
-			replies.push(
-				client.replyMessage({
-					replyToken: event.replyToken,
-					messages: [
-						quick(
-							"住宅手当はありますか？",
-							["ある", "ない"],
-							["subsidy=yes", "subsidy=no"],
-						),
-					],
-				}),
-			);
-			continue;
-		}
-
-		if (event.type === "postback" && event.postback) {
-			const data: string = event.postback.data;
-			const state = await getUserState(c.env.USER_STATE, uid);
-
-			if (state.step === 0) {
-				state.answers.subsidy = data.split("=")[1] === "yes";
-				state.step = 1;
-				await setUserState(c.env.USER_STATE, uid, state);
-				replies.push(
-					client.replyMessage({
-						replyToken: event.replyToken,
-						messages: [
-							quick(
-								"上限はいくらですか？",
-								["5万円以上", "3万円", "1万円以下"],
-								["subsidy=5", "subsidy=3", "subsidy=1"],
-							),
-						],
-					}),
-				);
-			} else if (state.step === 1) {
-				state.answers.subsidyAmount = Number(data.split("=")[1]);
-				state.step = 2;
-				await setUserState(c.env.USER_STATE, uid, state);
-				replies.push(
-					client.replyMessage({
-						replyToken: event.replyToken,
-						messages: [
-							quick(
-								"希望家賃帯は？",
-								["10-13万", "13-16万", "16万以上"],
-								["rent=10-13", "rent=13-16", "rent=16+"],
-							),
-						],
-					}),
-				);
-			} else if (state.step === 2) {
-				state.answers.rent = data.split("=")[1];
-				state.step = 99;
-				await setUserState(c.env.USER_STATE, uid, state);
-
-				const { subsidyAmount, rent } = state.answers;
-				if (subsidyAmount && rent) {
-					replies.push(
-						client.replyMessage({
-							replyToken: event.replyToken,
-							messages: [resultFlex(subsidyAmount * 10000, rent)],
-						}),
-					);
-				}
-			}
-		}
-
-		// Handle text messages - show quick reply if user hasn't started or is lost
-		if (event.type === "message" && event.message?.type === "text") {
-			const state = await getUserState(c.env.USER_STATE, uid);
-			if (state.step === undefined || state.step === 99) {
-				// User hasn't started or finished - restart the flow
-				const newState: UserState = { step: 0, answers: {} };
-				await setUserState(c.env.USER_STATE, uid, newState);
-				replies.push(
-					client.replyMessage({
-						replyToken: event.replyToken,
-						messages: [
-							quick(
-								"住宅手当はありますか？",
-								["ある", "ない"],
-								["subsidy=yes", "subsidy=no"],
-							),
-						],
-					}),
-				);
-			}
-		}
-	}
-
-	await Promise.all(replies);
-	return c.json({ status: "ok" });
-});
+// The new AI chat implementation above replaces this structured flow
+// with open-ended conversation powered by Cerebras AI.
+*/
 
 export default app;
